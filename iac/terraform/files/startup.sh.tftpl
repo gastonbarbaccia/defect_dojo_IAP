@@ -1,0 +1,155 @@
+#!/bin/bash
+# Arranque de la VM de DefectDojo (generado por Terraform). Idempotente: corre en cada boot.
+#   1. Instala Docker (repositorio oficial) y configura logs a Cloud Logging
+#   2. Clona DefectDojo en el tag indicado (o lo actualiza)
+#   3. Lee los secretos de Secret Manager y escribe .env (permisos 600)
+#   4. Copia el middleware de SSO a docker/extra_settings
+#   5. Espera el audience de IAP (metadata del proyecto) y escribe docker-compose.override.yml
+#   6. Levanta los contenedores
+set -euo pipefail
+exec >>/var/log/dojo-startup.log 2>&1
+echo "==== $(date -Is) inicio del arranque ===="
+
+DD_DIR=/opt/defectdojo
+DD_VERSION="${dd_version}"
+MD_URL=http://metadata.google.internal/computeMetadata/v1
+
+md() { curl -sf -H "Metadata-Flavor: Google" "$MD_URL/$1"; }
+# Lee un secreto regional por la API REST (no depende de la versión de gcloud de la imagen)
+secret() {
+  local token
+  token=$(md "instance/service-accounts/default/token" | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+  curl -sf --retry 5 --retry-delay 5 -H "Authorization: Bearer $token" \
+    "https://secretmanager.${region}.rep.googleapis.com/v1/projects/${project_id}/locations/${region}/secrets/$1/versions/latest:access" \
+    | python3 -c 'import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode(), end="")'
+}
+
+# ── 1. Docker ───────────────────────────────────────────────────────────────
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Instalando Docker"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y ca-certificates curl git gnupg
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  . /etc/os-release
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $VERSION_CODENAME stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+fi
+
+# Logs de los contenedores a Cloud Logging (docker compose logs sigue funcionando)
+if [ ! -f /etc/docker/daemon.json ]; then
+  cat > /etc/docker/daemon.json <<'JSON'
+{
+  "log-driver": "gcplogs",
+  "log-opts": { "gcp-meta-name": "${name}-vm" }
+}
+JSON
+  systemctl restart docker
+fi
+systemctl enable --now docker
+
+# ── 2. Código de DefectDojo ─────────────────────────────────────────────────
+if [ ! -d "$DD_DIR/.git" ]; then
+  echo "Clonando DefectDojo $DD_VERSION"
+  git clone --depth 1 --branch "$DD_VERSION" https://github.com/DefectDojo/django-DefectDojo.git "$DD_DIR"
+else
+  CURRENT=$(git -C "$DD_DIR" describe --tags --exact-match 2>/dev/null || echo "desconocida")
+  if [ "$CURRENT" != "$DD_VERSION" ]; then
+    echo "Actualizando DefectDojo de $CURRENT a $DD_VERSION"
+    git -C "$DD_DIR" fetch --depth 1 origin tag "$DD_VERSION"
+    git -C "$DD_DIR" checkout -f "$DD_VERSION"
+  fi
+fi
+cd "$DD_DIR"
+
+# ── 3. Secretos y .env ──────────────────────────────────────────────────────
+DB_PASSWORD=$(secret "${name}-db-password")
+SECRET_KEY=$(secret "${name}-secret-key")
+AES_KEY=$(secret "${name}-aes-key")
+ADMIN_PASSWORD=$(secret "${name}-admin-password")
+
+umask 077
+cat > .env <<EOF
+# Generado por el arranque de la VM. No editar a mano.
+COMPOSE_PROJECT_NAME=defectdojo
+DD_IMAGE_REGISTRY=${image_registry}
+DJANGO_VERSION=$DD_VERSION
+NGINX_VERSION=$DD_VERSION
+DD_PORT=8080
+DD_ALLOWED_HOSTS='${domain},localhost'
+DD_DATABASE_PASSWORD='$DB_PASSWORD'
+DD_DATABASE_URL='postgresql://defectdojo:$DB_PASSWORD@postgres:5432/defectdojo'
+DD_SECRET_KEY='$SECRET_KEY'
+DD_CREDENTIAL_AES_256_KEY='$AES_KEY'
+DD_ADMIN_PASSWORD='$ADMIN_PASSWORD'
+EOF
+umask 022
+
+# ── 4. Middleware de SSO (fases 2 y 3) ──────────────────────────────────────
+mkdir -p docker/extra_settings
+md instance/attributes/dojo-iap-sso-py > docker/extra_settings/iap_sso.py
+md instance/attributes/dojo-local-settings-py > docker/extra_settings/local_settings.py
+
+# ── 5. Audience de IAP y override ───────────────────────────────────────────
+SSO_ENABLED="${enable_sso}"
+AUDIENCE=""
+if [ "$SSO_ENABLED" = "true" ]; then
+  for _ in $(seq 1 90); do
+    AUDIENCE=$(md "project/attributes/${audience_metadata_key}" || true)
+    [ -n "$AUDIENCE" ] && break
+    echo "Esperando el audience de IAP en la metadata del proyecto..."
+    sleep 10
+  done
+  if [ -z "$AUDIENCE" ]; then
+    echo "AVISO: no se encontró el audience de IAP; se arranca sin SSO."
+    SSO_ENABLED="false"
+  fi
+fi
+
+cat > docker-compose.override.yml <<EOF
+# Generado por el arranque de la VM. No editar a mano.
+x-dojo-env: &dojo-env
+  DD_SITE_URL: "https://${domain}"
+  DD_CSRF_TRUSTED_ORIGINS: "https://${domain},http://localhost:8080"
+  DD_SECURE_PROXY_SSL_HEADER: "True"
+  DD_SESSION_COOKIE_SECURE: "True"
+  DD_CSRF_COOKIE_SECURE: "True"
+  DD_IAP_SSO_ENABLED: "$SSO_ENABLED"
+  DD_IAP_AUDIENCE: "$AUDIENCE"
+  DD_IAP_ALLOWED_DOMAINS: "${sso_allowed_domains}"
+  DD_IAP_CREATE_USERS: "true"
+  DD_IAP_DENY_USERNAMES: "admin"
+  DD_IAP_GROUP_SYNC_ENABLED: "${enable_group_sync}"
+  DD_IAP_SUPERUSER_GROUP: "${admins_group}"
+  DD_IAP_STAFF_GROUP: "${staff_group}"
+  DD_IAP_GROUPS_REFRESH_SECONDS: "900"
+
+services:
+  nginx:
+    restart: unless-stopped
+  uwsgi:
+    restart: unless-stopped
+    environment: *dojo-env
+  celerybeat:
+    restart: unless-stopped
+    environment: *dojo-env
+  celeryworker:
+    restart: unless-stopped
+    environment: *dojo-env
+  initializer:
+    environment:
+      DD_ADMIN_PASSWORD: "\$${DD_ADMIN_PASSWORD}"
+  postgres:
+    restart: unless-stopped
+  valkey:
+    restart: unless-stopped
+EOF
+
+# ── 6. Levantar DefectDojo ──────────────────────────────────────────────────
+docker compose pull --quiet
+docker compose up -d --remove-orphans
+echo "==== $(date -Is) DefectDojo $DD_VERSION levantado (SSO=$SSO_ENABLED) ===="

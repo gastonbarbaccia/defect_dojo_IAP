@@ -1,0 +1,40 @@
+# Copiar a terraform.tfvars y completar.
+project_id       = "mi-proyecto"
+region           = "southamerica-east1"
+zone             = "southamerica-east1-a"
+
+domain           = "dojo.empresa.com"
+workspace_domain = "empresa.com"
+users_group      = "dojo-users@empresa.com"
+admins_group     = "dojo-admins@empresa.com"
+
+# ── Variante con Google Groups gratuitos (@googlegroups.com) y cuentas @gmail.com ──
+# workspace_domain        = ""
+# users_group             = "dojo-users-devcode@googlegroups.com"
+# admins_group            = "dojo-admins-devcode@googlegroups.com"
+# sso_allowed_domains     = ["gmail.com"]          # o [] para no filtrar por dominio
+# iap_oauth_client_id     = "XXXX.apps.googleusercontent.com"   # cliente OAuth propio (External)
+# iap_oauth_client_secret = "GOCSPX-..."           # mejor por variable de entorno TF_VAR_iap_oauth_client_secret
+# enable_group_sync       = false                  # la API de grupos no lee grupos @googlegroups.com
+
+defectdojo_version = "3.5.103"
+
+# Fase 2: un solo login con el JWT de IAP
+enable_sso = true
+
+# Fase 3: roles por grupo (activar después de asignar "Groups Reader" a la service account, ver README)
+enable_group_sync = false
+# Grupo que recibe staff (ve TODOS los productos). Vacío = nadie por grupo.
+staff_group       = ""
+
+# IPs fijas del CI/CD para /api/v2 (vacío = la API queda detrás de IAP)
+ci_source_ranges = []
+
+# Quién pasa IAP: "group" (solo miembros de users_group/admins_group)
+#                o "domain" (cualquier cuenta de Google de workspace_domain)
+iap_access_mode = "group"
+
+# Validación de dispositivo (Access Context Manager). Vacío = no se valida el dispositivo.
+access_level = ""
+
+enable_siem_export = false
